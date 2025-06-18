@@ -6,6 +6,7 @@
 package com.wireguard.config;
 
 import com.wireguard.util.NonNullForAll;
+import com.wireguard.util.SimpleDns;
 
 import java.net.Inet4Address;
 import java.net.InetAddress;
@@ -14,7 +15,9 @@ import java.net.URISyntaxException;
 import java.net.UnknownHostException;
 import java.time.Duration;
 import java.time.Instant;
+import java.util.List;
 import java.util.Optional;
+import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 import androidx.annotation.Nullable;
@@ -29,6 +32,7 @@ import androidx.annotation.Nullable;
 public final class InetEndpoint {
     private static final Pattern BARE_IPV6 = Pattern.compile("^[^\\[\\]]*:[^\\[\\]]*");
     private static final Pattern FORBIDDEN_CHARACTERS = Pattern.compile("[/?#]");
+    private static final Pattern IPV4_PORT_PATTERN = Pattern.compile("^(\\d{1,3}(?:\\.\\d{1,3}){3}):(\\d{1,5})$");
 
     private final String host;
     private final boolean isResolved;
@@ -91,25 +95,53 @@ public final class InetEndpoint {
         if (isResolved)
             return Optional.of(this);
         synchronized (lock) {
-            //TODO(zx2c4): Implement a real timeout mechanism using DNS TTL
             if (Duration.between(lastResolution, Instant.now()).toMinutes() > 1) {
-                try {
-                    // Prefer v4 endpoints over v6 to work around DNS64 and IPv6 NAT issues.
-                    final InetAddress[] candidates = InetAddress.getAllByName(host);
-                    InetAddress address = candidates[0];
-                    for (final InetAddress candidate : candidates) {
-                        if (candidate instanceof Inet4Address) {
-                            address = candidate;
-                            break;
-                        }
-                    }
-                    resolved = new InetEndpoint(address.getHostAddress(), true, port);
+                InetEndpoint txtResolved = resolveFromTxtRecord();
+                if (txtResolved != null) {
+                    resolved = txtResolved;
                     lastResolution = Instant.now();
-                } catch (final UnknownHostException e) {
-                    resolved = null;
+                } else {
+                    resolved = resolveFromDns();
+                    lastResolution = Instant.now();
                 }
             }
             return Optional.ofNullable(resolved);
+        }
+    }
+
+    @Nullable
+    private InetEndpoint resolveFromTxtRecord() {
+        try {
+            List<String> records = SimpleDns.lookupTxt(host).get();
+            if (records != null) {
+                for (String record : records) {
+                    Matcher matcher = IPV4_PORT_PATTERN.matcher(record);
+                    if (matcher.matches()) {
+                        String ip = matcher.group(1);
+                        int txtPort = Integer.parseInt(matcher.group(2));
+                        return new InetEndpoint(ip, true, txtPort);
+                    }
+                }
+            }
+        } catch (Exception ignored) {}
+        return null;
+    }
+
+    @Nullable
+    private InetEndpoint resolveFromDns() {
+        try {
+            // Prefer v4 endpoints over v6 to work around DNS64 and IPv6 NAT issues.
+            final InetAddress[] candidates = InetAddress.getAllByName(host);
+            InetAddress address = candidates[0];
+            for (final InetAddress candidate : candidates) {
+                if (candidate instanceof Inet4Address) {
+                    address = candidate;
+                    break;
+                }
+            }
+            return new InetEndpoint(address.getHostAddress(), true, port);
+        } catch (final UnknownHostException e) {
+            return null;
         }
     }
 
